@@ -17,6 +17,7 @@ import (
 	audio "github.com/oandrew/ipod/lingo-audio"
 	dispremote "github.com/oandrew/ipod/lingo-dispremote"
 	extremote "github.com/oandrew/ipod/lingo-extremote"
+	"github.com/oandrew/ipod/lingo-extremote/bluez"
 	general "github.com/oandrew/ipod/lingo-general"
 	_ "github.com/oandrew/ipod/lingo-simpleremote"
 	"github.com/oandrew/ipod/trace"
@@ -384,6 +385,20 @@ func processFrames(frameTransport ipod.FrameReadWriter) {
 }
 
 var devGeneral = &DevGeneral{}
+var devExtRemote extremote.DeviceExtRemote = initExtRemote()
+
+// initExtRemote constructs a BlueZ-backed extremote device. A failure to
+// connect to the system bus or to BlueZ is logged but does not crash the
+// process; the returned device will be nil and the extremote handler falls
+// back to inert defaults.
+func initExtRemote() extremote.DeviceExtRemote {
+	c, err := bluez.NewClient()
+	if err != nil {
+		log.WithError(err).Warn("bluez: MediaPlayer1 client unavailable")
+		return nil
+	}
+	return c
+}
 
 func handlePacket(cmdWriter ipod.CommandWriter, cmd *ipod.Command) {
 	switch cmd.ID.LingoID() {
@@ -401,7 +416,7 @@ func handlePacket(cmdWriter ipod.CommandWriter, cmd *ipod.Command) {
 	case ipod.LingoDisplayRemoteID:
 		dispremote.HandleDispRemote(cmd, cmdWriter, nil)
 	case ipod.LingoExtRemoteID:
-		extremote.HandleExtRemote(cmd, cmdWriter, nil)
+		extremote.HandleExtRemote(cmd, cmdWriter, devExtRemote)
 	case ipod.LingoDigitalAudioID:
 		audio.HandleAudio(cmd, cmdWriter, nil)
 	}
