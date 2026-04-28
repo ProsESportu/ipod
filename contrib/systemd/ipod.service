@@ -1,0 +1,44 @@
+[Unit]
+Description=iPod accessory protocol daemon (BlueZ MediaPlayer1 bridge)
+Documentation=https://github.com/oandrew/ipod
+# The ipod-gadget char device must exist before we can open it. BindsTo
+# ensures the service is stopped if the device disappears (e.g. USB unplug).
+BindsTo=dev-iap0.device
+After=dev-iap0.device
+# We talk to BlueZ via the system bus.
+Wants=bluetooth.service dbus.service
+After=bluetooth.service dbus.service
+
+[Service]
+Type=simple
+# Adjust the binary path if you installed somewhere else.
+ExecStart=/usr/local/bin/ipod serve /dev/iap0
+
+# Running as root is the simplest way to get access to /dev/iap0 and the
+# BlueZ system-bus interface. See INSTALL.md for how to run as an
+# unprivileged user instead.
+User=root
+Group=root
+
+Restart=on-failure
+RestartSec=2s
+
+# Hardening. These are safe defaults for this daemon; relax them if you
+# need to run custom scripts or attach a debugger.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# /dev/iap0 is a character device; allow access explicitly since
+# ProtectSystem=strict makes /dev read-only by default for some paths.
+DeviceAllow=/dev/iap0 rw
+
+[Install]
+WantedBy=multi-user.target
