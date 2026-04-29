@@ -137,6 +137,8 @@ func main() {
 				if path == "" {
 					return UsageError{fmt.Errorf("device path is missing")}
 				}
+				ensureExtRemote()
+
 				f, err := openDevice(path)
 				le := log.WithField("path", path)
 				if err != nil {
@@ -225,6 +227,12 @@ func main() {
 				if path == "" {
 					return UsageError{fmt.Errorf("device path is missing")}
 				}
+				tpath := c.Args().Get(1)
+				if tpath == "" {
+					return UsageError{cli.NewExitError("trace file path is missing", 1)}
+				}
+				ensureExtRemote()
+
 				f, err := openDevice(path)
 				le := log.WithField("path", path)
 				if err != nil {
@@ -233,11 +241,6 @@ func main() {
 				}
 				le.Info("device opened")
 
-				tpath := c.Args().Get(1)
-				if tpath == "" {
-					return UsageError{cli.NewExitError("trace file path is missing", 1)}
-				}
-
 				tf, err := openTraceFile(tpath)
 				tle := log.WithField("path", tpath)
 				if err != nil {
@@ -245,6 +248,7 @@ func main() {
 					return err
 				}
 				tle.Warningf("trace file opened")
+
 				tr := trace.NewReader(tf)
 				tdr := trace.NewTraceDirReader(tr, trace.DirIn)
 
@@ -385,19 +389,30 @@ func processFrames(frameTransport ipod.FrameReadWriter) {
 }
 
 var devGeneral = &DevGeneral{}
-var devExtRemote extremote.DeviceExtRemote = initExtRemote()
+var devExtRemote extremote.DeviceExtRemote
 
-// initExtRemote constructs a BlueZ-backed extremote device. A failure to
-// connect to the system bus or to BlueZ is logged but does not crash the
-// process; the returned device will be nil and the extremote handler falls
-// back to inert defaults.
-func initExtRemote() extremote.DeviceExtRemote {
-	c, err := bluez.NewClient()
-	if err != nil {
-		log.WithError(err).Warn("bluez: MediaPlayer1 client unavailable")
-		return nil
+func ensureExtRemote() {
+	if devExtRemote == nil {
+		devExtRemote = initExtRemote()
 	}
-	return c
+}
+
+// initExtRemote constructs a BlueZ-backed extremote device and blocks until
+// BlueZ reports a connected Bluetooth device.
+func initExtRemote() extremote.DeviceExtRemote {
+	for {
+		c, err := bluez.NewClient()
+		if err != nil {
+			log.WithError(err).Warn("bluez: MediaPlayer1 client unavailable; retrying")
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if !c.DeviceConnected() {
+			log.Warn("bluez: waiting for a connected Bluetooth device")
+		}
+		c.WaitDeviceConnected()
+		return c
+	}
 }
 
 func handlePacket(cmdWriter ipod.CommandWriter, cmd *ipod.Command) {

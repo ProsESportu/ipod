@@ -22,6 +22,7 @@ import (
 
 const (
 	bluezService        = "org.bluez"
+	deviceIface         = "org.bluez.Device1"
 	mediaPlayerIface    = "org.bluez.MediaPlayer1"
 	objectManagerIface  = "org.freedesktop.DBus.ObjectManager"
 	propertiesIface     = "org.freedesktop.DBus.Properties"
@@ -37,14 +38,16 @@ const (
 type Client struct {
 	conn *dbus.Conn
 
-	mu            sync.RWMutex
-	path          dbus.ObjectPath // "" when no player is available
-	status        string
-	position      uint32 // milliseconds
-	positionSetAt time.Time
-	track         extremote.TrackMetadata
-	shuffle       string
-	repeat        string
+	mu              sync.RWMutex
+	cond            *sync.Cond
+	deviceConnected bool
+	path            dbus.ObjectPath // "" when no player is available
+	status          string
+	position        uint32 // milliseconds
+	positionSetAt   time.Time
+	track           extremote.TrackMetadata
+	shuffle         string
+	repeat          string
 }
 
 var _ extremote.DeviceExtRemote = (*Client)(nil)
@@ -58,10 +61,13 @@ func NewClient() (*Client, error) {
 		return nil, fmt.Errorf("bluez: system bus: %w", err)
 	}
 	c := &Client{conn: conn}
+	c.cond = sync.NewCond(&c.mu)
 	if err := c.watch(); err != nil {
+		conn.Close()
 		return nil, err
 	}
 	if err := c.discover(); err != nil {
+		conn.Close()
 		return nil, err
 	}
 	return c, nil
@@ -106,6 +112,13 @@ func (c *Client) loop(ch <-chan *dbus.Signal) {
 				continue
 			}
 			iface, _ := sig.Body[0].(string)
+			changed, _ := sig.Body[1].(map[string]dbus.Variant)
+			if iface == deviceIface {
+				if connectedProps(changed) {
+					c.setDeviceConnected(true)
+				}
+				continue
+			}
 			if iface != mediaPlayerIface {
 				continue
 			}
@@ -115,7 +128,6 @@ func (c *Client) loop(ch <-chan *dbus.Signal) {
 			if current == "" || sig.Path != current {
 				continue
 			}
-			changed, _ := sig.Body[1].(map[string]dbus.Variant)
 			c.applyProps(changed)
 
 		case interfacesAddedFn:
@@ -124,6 +136,9 @@ func (c *Client) loop(ch <-chan *dbus.Signal) {
 			}
 			path, _ := sig.Body[0].(dbus.ObjectPath)
 			ifaces, _ := sig.Body[1].(map[string]map[string]dbus.Variant)
+			if props, ok := ifaces[deviceIface]; ok && connectedProps(props) {
+				c.setDeviceConnected(true)
+			}
 			props, ok := ifaces[mediaPlayerIface]
 			if !ok {
 				continue
@@ -173,6 +188,9 @@ func (c *Client) discover() error {
 	}
 	paths := make([]string, 0, len(managed))
 	for p, ifaces := range managed {
+		if props, ok := ifaces[deviceIface]; ok && connectedProps(props) {
+			c.setDeviceConnected(true)
+		}
 		if _, ok := ifaces[mediaPlayerIface]; ok {
 			paths = append(paths, string(p))
 		}
@@ -187,13 +205,56 @@ func (c *Client) discover() error {
 	return nil
 }
 
+func connectedProps(props map[string]dbus.Variant) bool {
+	if v, ok := props["Connected"]; ok {
+		connected, _ := v.Value().(bool)
+		return connected
+	}
+	return false
+}
+
+func (c *Client) setDeviceConnected(connected bool) {
+	c.mu.Lock()
+	c.deviceConnected = connected
+	if connected {
+		c.cond.Broadcast()
+	}
+	c.mu.Unlock()
+}
+
 // adopt switches to the given player path and seeds the cache from props.
 func (c *Client) adopt(path dbus.ObjectPath, props map[string]dbus.Variant) {
 	c.mu.Lock()
 	c.path = path
+	c.cond.Broadcast()
 	c.mu.Unlock()
 	log.Printf("bluez: using MediaPlayer1 at %s", path)
 	c.applyProps(props)
+}
+
+// DeviceConnected reports whether a Bluetooth Device1 is connected.
+func (c *Client) DeviceConnected() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.deviceConnected
+}
+
+// WaitDeviceConnected blocks until a Bluetooth Device1 is connected.
+func (c *Client) WaitDeviceConnected() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for !c.deviceConnected {
+		c.cond.Wait()
+	}
+}
+
+// WaitAvailable blocks until a MediaPlayer1 object is currently adopted.
+func (c *Client) WaitAvailable() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for c.path == "" {
+		c.cond.Wait()
+	}
 }
 
 // applyProps merges a PropertiesChanged-style dict into the cached snapshot.
