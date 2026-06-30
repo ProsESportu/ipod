@@ -1,0 +1,18 @@
+[package]
+name = "ipod"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Userspace implementation of the classic iPod Accessory Protocol"
+
+[lib]
+name = "ipod"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ipod"
+path = "src/bin/ipod.rs"
+
+[profile.release]
+strip = true
+lto = true

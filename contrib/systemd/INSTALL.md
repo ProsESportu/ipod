@@ -1,7 +1,8 @@
 # Installing `ipod.service`
 
 A systemd unit that runs `ipod serve /dev/iap0` in the background and bridges
-the iPod accessory protocol to BlueZ's `org.bluez.MediaPlayer1` interface.
+the iPod accessory protocol to BlueZ's `org.bluez.MediaPlayer1` interface and
+BlueALSA digital audio playback.
 
 The unit file is deliberately *not* installed automatically &mdash; these
 instructions walk through placing the files yourself.
@@ -10,6 +11,8 @@ instructions walk through placing the files yourself.
 
 - Linux with `systemd`.
 - `bluez` 5.x running and providing the system-bus service `org.bluez`.
+- BlueALSA installed, with `bluealsa.service` available and `bluealsa-aplay`
+  on the service user's `PATH`.
 - The [`ipod-gadget`](https://github.com/oandrew/ipod-gadget) kernel module
   loaded and creating `/dev/iap0`.
 - A compiled `ipod` binary (see the top-level [README](../../README.md)).
@@ -29,6 +32,23 @@ sudo install -m 0755 ipod /usr/local/bin/ipod
 ```
 
 If you install it elsewhere, edit `ExecStart=` in `ipod.service` accordingly.
+
+`ipod serve` starts `bluealsa-aplay` by default when the iPod link enters
+digital-audio initialization. The `serve` process fails if `bluealsa-aplay` is
+missing, cannot be started, or exits while `serve` is running. If your
+distribution installs the executable outside the service user's `PATH`, add the
+override to `ExecStart=`:
+
+```ini
+ExecStart=/usr/local/bin/ipod serve --bluealsa-aplay /usr/bin/bluealsa-aplay /dev/iap0
+```
+
+Additional `bluealsa-aplay` options can be passed with repeated
+`--bluealsa-aplay-arg` flags:
+
+```ini
+ExecStart=/usr/local/bin/ipod serve --bluealsa-aplay-arg=--pcm=default /dev/iap0
+```
 
 ## 2. Install the unit file
 
@@ -64,6 +84,20 @@ bluez: using MediaPlayer1 at /org/bluez/hci0/dev_XX_XX_XX_XX_XX_XX/player0
 
 Track metadata (title / artist / album) and play status should now be
 propagated to the head unit over the iAP link.
+
+## 5. Verify BlueALSA playback
+
+The shipped unit wants and orders itself after `bluealsa.service`. During
+digital-audio initialization, `ipod serve` starts `bluealsa-aplay` and keeps it
+under the `serve` process. Check the logs if startup fails or playback stops:
+
+```sh
+journalctl -u ipod.service -u bluealsa.service -f
+```
+
+If the log shows that `bluealsa-aplay` is missing or exited, install the
+BlueALSA player package, fix the executable path with `--bluealsa-aplay`, or
+adjust its arguments with repeated `--bluealsa-aplay-arg` flags.
 
 ## Running as an unprivileged user (optional)
 
@@ -149,3 +183,7 @@ sudo rm /usr/local/bin/ipod
 - **Different device node** &mdash; change both the `BindsTo=`/`After=`
   `.device` units and the `ExecStart=` arguments. For `/dev/iap1` those
   become `dev-iap1.device` and `serve /dev/iap1`.
+- **Different `bluealsa-aplay` executable** &mdash; append
+  `--bluealsa-aplay /path/to/bluealsa-aplay` before the device argument.
+- **Extra `bluealsa-aplay` arguments** &mdash; append one
+  `--bluealsa-aplay-arg VALUE` per argument before the device argument.
