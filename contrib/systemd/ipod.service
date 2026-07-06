@@ -1,17 +1,22 @@
 [Unit]
-Description=iPod accessory protocol daemon (BlueZ MediaPlayer1 bridge)
+Description=iPod accessory protocol daemon (BlueZ MediaPlayer1 and BlueALSA bridge)
 Documentation=https://github.com/oandrew/ipod
 # The ipod-gadget char device must exist before we can open it. BindsTo
 # ensures the service is stopped if the device disappears (e.g. USB unplug).
 BindsTo=dev-iap0.device
 After=dev-iap0.device
-# We talk to BlueZ via the system bus.
-Wants=bluetooth.service dbus.service
-After=bluetooth.service dbus.service
+# We talk to BlueZ via the system bus and start bluealsa-aplay during
+# digital-audio initialization. ipod serve exits if bluealsa-aplay cannot be
+# started or later exits, so keep BlueALSA ordered before this service.
+Wants=bluetooth.service dbus.service bluealsa.service
+After=bluetooth.service dbus.service bluealsa.service
 
 [Service]
 Type=simple
 # Adjust the binary path if you installed somewhere else.
+# ipod serve starts bluealsa-aplay by default during digital-audio
+# initialization. Use repeated --bluealsa-aplay-arg options to pass extra
+# arguments to bluealsa-aplay, or --bluealsa-aplay to choose another executable.
 ExecStart=/usr/local/bin/ipod serve /dev/iap0
 
 # Running as root is the simplest way to get access to /dev/iap0 and the
