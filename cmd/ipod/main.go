@@ -131,15 +131,6 @@ func main() {
 					Name:  "write-trace, w",
 					Usage: "Write trace to a `file`",
 				},
-				cli.StringFlag{
-					Name:  "bluealsa-aplay",
-					Usage: "bluealsa-aplay executable `path`",
-					Value: defaultBlueALSAAPlay,
-				},
-				cli.StringSliceFlag{
-					Name:  "bluealsa-aplay-arg",
-					Usage: "extra argument to pass to bluealsa-aplay",
-				},
 			},
 			Action: func(c *cli.Context) error {
 				path := c.Args().First()
@@ -156,14 +147,6 @@ func main() {
 				}
 				le.Info("device opened")
 
-				bluealsa := newBlueALSAPlayer(
-					c.String("bluealsa-aplay"),
-					c.StringSlice("bluealsa-aplay-arg"),
-					nil,
-					log.Out,
-					c.App.ErrWriter,
-				)
-
 				var rw io.ReadWriter = f
 				if tracePath := c.String("write-trace"); tracePath != "" {
 					traceFile, err := newTraceFile(tracePath)
@@ -178,37 +161,8 @@ func main() {
 
 				reportR, reportW := hid.NewReportReader(rw), hid.NewReportWriter(rw)
 				frameTransport := hid.NewTransport(reportR, reportW, hidReportDefs)
-				frameErr := make(chan error, 1)
-				stopFrames := make(chan struct{})
-				go func() {
-					frameErr <- processFramesWithOptions(frameTransport, frameLoopOptions{
-						onPlaybackInitialized: bluealsa.Start,
-						stop:                  stopFrames,
-					})
-				}()
-
-				select {
-				case err := <-frameErr:
-					select {
-					case bluealsaErr := <-bluealsa.Err():
-						bluealsa.Stop()
-						if err != nil {
-							return err
-						}
-						return bluealsaErr
-					default:
-					}
-					if stopErr := bluealsa.Stop(); stopErr != nil {
-						return stopErr
-					}
-					return err
-				case err := <-bluealsa.Err():
-					close(stopFrames)
-					f.Close()
-					<-frameErr
-					bluealsa.Stop()
-					return err
-				}
+				processFrames(frameTransport)
+				return nil
 			},
 		},
 		{
@@ -381,17 +335,7 @@ func logCmd(cmd *ipod.Command, err error, msg string) {
 }
 
 func processFrames(frameTransport ipod.FrameReadWriter) {
-	processFramesWithOptions(frameTransport, frameLoopOptions{})
-}
-
-type frameLoopOptions struct {
-	onPlaybackInitialized func() error
-	stop                  <-chan struct{}
-}
-
-func processFramesWithOptions(frameTransport ipod.FrameReadWriter, opts frameLoopOptions) error {
 	serde := ipod.CommandSerde{}
-	playbackInitialized := false
 
 	for {
 		inFrame, err := frameTransport.ReadFrame()
@@ -400,11 +344,6 @@ func processFramesWithOptions(frameTransport ipod.FrameReadWriter, opts frameLoo
 		}
 		logFrame(inFrame, err, "<< FRAME")
 		if err != nil {
-			select {
-			case <-opts.stop:
-				return err
-			default:
-			}
 			continue
 		}
 
@@ -426,16 +365,11 @@ func processFramesWithOptions(frameTransport ipod.FrameReadWriter, opts frameLoo
 		}
 
 		outCmdBuf := ipod.CmdBuffer{}
-		shouldInitPlayback := false
 		for i := range inCmdBuf.Commands {
 			//todo: check return error
-			result := handlePacketWithResult(&outCmdBuf, inCmdBuf.Commands[i])
-			if result.playbackInitialized {
-				shouldInitPlayback = true
-			}
+			handlePacket(&outCmdBuf, inCmdBuf.Commands[i])
 		}
 
-		writeErr := false
 		for i := range outCmdBuf.Commands {
 			outCmd := outCmdBuf.Commands[i]
 			logCmd(outCmd, nil, ">> CMD")
@@ -448,23 +382,10 @@ func processFramesWithOptions(frameTransport ipod.FrameReadWriter, opts frameLoo
 			outFrame := packetWriter.Bytes()
 			outFrameErr := frameTransport.WriteFrame(outFrame)
 			logFrame(outFrame, outFrameErr, ">> FRAME")
-			if outFrameErr != nil {
-				writeErr = true
-			}
-		}
-
-		if shouldInitPlayback && !playbackInitialized && !writeErr {
-			playbackInitialized = true
-			if opts.onPlaybackInitialized != nil {
-				if err := opts.onPlaybackInitialized(); err != nil {
-					return err
-				}
-			}
 		}
 
 	}
 	log.Warnf("EOF")
-	return nil
 }
 
 var devGeneral = &DevGeneral{}
@@ -494,16 +415,7 @@ func initExtRemote() extremote.DeviceExtRemote {
 	}
 }
 
-type handlePacketResult struct {
-	playbackInitialized bool
-}
-
 func handlePacket(cmdWriter ipod.CommandWriter, cmd *ipod.Command) {
-	handlePacketWithResult(cmdWriter, cmd)
-}
-
-func handlePacketWithResult(cmdWriter ipod.CommandWriter, cmd *ipod.Command) handlePacketResult {
-	var result handlePacketResult
 	switch cmd.ID.LingoID() {
 	case ipod.LingoGeneralID:
 		if auth, ok := cmd.Payload.(*general.RetDevAuthenticationInfo); ok {
@@ -521,12 +433,8 @@ func handlePacketWithResult(cmdWriter ipod.CommandWriter, cmd *ipod.Command) han
 	case ipod.LingoExtRemoteID:
 		extremote.HandleExtRemote(cmd, cmdWriter, devExtRemote)
 	case ipod.LingoDigitalAudioID:
-		if _, ok := cmd.Payload.(*audio.RetAccSampleRateCaps); ok {
-			result.playbackInitialized = true
-		}
 		audio.HandleAudio(cmd, cmdWriter, nil)
 	}
-	return result
 }
 func dirPrefix(dir trace.Dir, text string) string {
 	switch dir {
