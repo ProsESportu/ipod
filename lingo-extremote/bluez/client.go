@@ -12,6 +12,7 @@ import (
 	"log"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,16 +39,19 @@ const (
 type Client struct {
 	conn *dbus.Conn
 
-	mu              sync.RWMutex
-	cond            *sync.Cond
-	deviceConnected bool
-	path            dbus.ObjectPath // "" when no player is available
-	status          string
-	position        uint32 // milliseconds
-	positionSetAt   time.Time
-	track           extremote.TrackMetadata
-	shuffle         string
-	repeat          string
+	mu                  sync.RWMutex
+	cond                *sync.Cond
+	deviceConnected     bool
+	path                dbus.ObjectPath // "" when no player is available
+	status              string
+	position            uint32 // milliseconds
+	positionSetAt       time.Time
+	track               extremote.TrackMetadata
+	trackFingerprint    string
+	trackFingerprintSet bool
+	trackChanges        chan extremote.TrackChange
+	shuffle             string
+	repeat              string
 }
 
 var _ extremote.DeviceExtRemote = (*Client)(nil)
@@ -60,7 +64,10 @@ func NewClient() (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bluez: system bus: %w", err)
 	}
-	c := &Client{conn: conn}
+	c := &Client{
+		conn:         conn,
+		trackChanges: make(chan extremote.TrackChange, 16),
+	}
 	c.cond = sync.NewCond(&c.mu)
 	if err := c.watch(); err != nil {
 		conn.Close()
@@ -169,6 +176,8 @@ func (c *Client) loop(ch <-chan *dbus.Signal) {
 					c.position = 0
 					c.positionSetAt = time.Time{}
 					c.track = extremote.TrackMetadata{}
+					c.trackFingerprint = ""
+					c.trackFingerprintSet = false
 					c.shuffle = ""
 					c.repeat = ""
 				}
@@ -259,8 +268,9 @@ func (c *Client) WaitAvailable() {
 
 // applyProps merges a PropertiesChanged-style dict into the cached snapshot.
 func (c *Client) applyProps(props map[string]dbus.Variant) {
+	var trackChange *extremote.TrackChange
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	for k, v := range props {
 		switch k {
 		case "Status":
@@ -282,9 +292,24 @@ func (c *Client) applyProps(props map[string]dbus.Variant) {
 			}
 		case "Track":
 			if td, ok := v.Value().(map[string]dbus.Variant); ok {
-				c.track = trackFromVariants(td)
+				track := trackFromVariants(td)
+				fingerprint := trackFingerprint(td)
+				if c.trackFingerprintSet && fingerprint != c.trackFingerprint {
+					trackChange = &extremote.TrackChange{
+						Track:      track,
+						TrackIndex: extremote.TrackIndexFromMetadata(track),
+					}
+				}
+				c.track = track
+				c.trackFingerprint = fingerprint
+				c.trackFingerprintSet = true
 			}
 		}
+	}
+	c.mu.Unlock()
+
+	if trackChange != nil {
+		c.emitTrackChange(*trackChange)
 	}
 }
 
@@ -318,6 +343,38 @@ func trackFromVariants(m map[string]dbus.Variant) extremote.TrackMetadata {
 		t.Duration = n
 	}
 	return t
+}
+
+func trackFingerprint(m map[string]dbus.Variant) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	for _, k := range keys {
+		v := m[k]
+		fmt.Fprintf(&b, "%s\x00%s\x00%#v\x00", k, v.Signature().String(), v.Value())
+	}
+	return b.String()
+}
+
+func (c *Client) emitTrackChange(change extremote.TrackChange) {
+	if c.trackChanges == nil {
+		return
+	}
+	select {
+	case c.trackChanges <- change:
+	default:
+		log.Printf("bluez: dropping track change notification")
+	}
+}
+
+// TrackChanges returns internal song-change events derived from BlueZ
+// MediaPlayer1 PropertiesChanged signals for the Track property.
+func (c *Client) TrackChanges() <-chan extremote.TrackChange {
+	return c.trackChanges
 }
 
 // Available reports whether a MediaPlayer1 object is currently adopted.

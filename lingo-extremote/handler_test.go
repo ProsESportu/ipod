@@ -76,3 +76,57 @@ func TestHandleExtRemoteSetCurrentPlayingTrackSkipsOnce(t *testing.T) {
 		})
 	}
 }
+
+func TestHandleExtRemotePlayStatusNotificationMask(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload interface{}
+		want    bool
+	}{
+		{
+			name:    "four byte track index mask",
+			payload: &SetPlayStatusChangeNotification{EventMask: PlayStatusNotificationTrackIndex},
+			want:    true,
+		},
+		{
+			name:    "short enable",
+			payload: &SetPlayStatusChangeNotificationShort{Enabled: true},
+			want:    true,
+		},
+		{
+			name:    "four byte disable",
+			payload: &SetPlayStatusChangeNotification{EventMask: 0},
+			want:    false,
+		},
+		{
+			name:    "short disable",
+			payload: &SetPlayStatusChangeNotificationShort{Enabled: false},
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := ipod.BuildCommand(tt.payload)
+			if err != nil {
+				t.Fatalf("BuildCommand: %v", err)
+			}
+			tr := &ipod.CmdBuffer{}
+			notifications := NewPlayStatusNotificationState()
+
+			if err := HandleExtRemoteWithNotifications(req, tr, nil, notifications); err != nil {
+				t.Fatalf("HandleExtRemoteWithNotifications: %v", err)
+			}
+
+			if got := notifications.TrackIndexEnabled(); got != tt.want {
+				t.Fatalf("TrackIndexEnabled = %v, want %v", got, tt.want)
+			}
+			if len(tr.Commands) != 1 {
+				t.Fatalf("responses = %d, want 1", len(tr.Commands))
+			}
+			if _, ok := tr.Commands[0].Payload.(*ACK); !ok {
+				t.Fatalf("response payload = %T, want *ACK", tr.Commands[0].Payload)
+			}
+		})
+	}
+}

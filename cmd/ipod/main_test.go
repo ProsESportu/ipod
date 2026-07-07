@@ -4,9 +4,11 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/oandrew/ipod"
 	audio "github.com/oandrew/ipod/lingo-audio"
+	extremote "github.com/oandrew/ipod/lingo-extremote"
 )
 
 type testFrameTransport struct {
@@ -31,6 +33,48 @@ func (t *testFrameTransport) WriteFrame(frame []byte) error {
 	t.writes = append(t.writes, append([]byte(nil), frame...))
 	return nil
 }
+
+type readFrameResult struct {
+	frame []byte
+	err   error
+}
+
+type blockingFrameTransport struct {
+	reads  chan readFrameResult
+	writes chan []byte
+}
+
+func (t *blockingFrameTransport) ReadFrame() ([]byte, error) {
+	r := <-t.reads
+	return r.frame, r.err
+}
+
+func (t *blockingFrameTransport) WriteFrame(frame []byte) error {
+	t.writes <- append([]byte(nil), frame...)
+	return nil
+}
+
+type fakeTrackChangeDevice struct {
+	changes chan extremote.TrackChange
+}
+
+func (d *fakeTrackChangeDevice) PlaybackStatus() (uint32, uint32, extremote.PlayerState) {
+	return 0, 0, extremote.PlayerStateStopped
+}
+
+func (d *fakeTrackChangeDevice) Track() extremote.TrackMetadata { return extremote.TrackMetadata{} }
+
+func (d *fakeTrackChangeDevice) Shuffle() extremote.ShuffleMode { return extremote.ShuffleOff }
+
+func (d *fakeTrackChangeDevice) SetShuffle(extremote.ShuffleMode) error { return nil }
+
+func (d *fakeTrackChangeDevice) Repeat() extremote.RepeatMode { return extremote.RepeatOff }
+
+func (d *fakeTrackChangeDevice) SetRepeat(extremote.RepeatMode) error { return nil }
+
+func (d *fakeTrackChangeDevice) PlayControl(extremote.PlayControlCmd) error { return nil }
+
+func (d *fakeTrackChangeDevice) TrackChanges() <-chan extremote.TrackChange { return d.changes }
 
 func audioFrame(tb testing.TB, payload interface{}) []byte {
 	tb.Helper()
@@ -106,5 +150,87 @@ func TestProcessFramesReturnsReadErrorWhenStopped(t *testing.T) {
 	err := processFramesWithOptions(tr, frameLoopOptions{stop: stop})
 	if !errors.Is(err, readErr) {
 		t.Fatalf("processFramesWithOptions error = %v, want %v", err, readErr)
+	}
+}
+
+func TestProcessFramesWritesAsyncCommandWhileReadBlocked(t *testing.T) {
+	tr := &blockingFrameTransport{
+		reads:  make(chan readFrameResult),
+		writes: make(chan []byte, 1),
+	}
+	asyncCommands := make(chan *ipod.Command, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- processFramesWithOptions(tr, frameLoopOptions{asyncCommands: asyncCommands})
+	}()
+
+	cmd, err := ipod.BuildCommand(extremote.NewTrackIndexPlayStatusChangeNotification(4))
+	if err != nil {
+		t.Fatalf("BuildCommand: %v", err)
+	}
+	asyncCommands <- cmd
+
+	var frame []byte
+	select {
+	case frame = <-tr.writes:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for async frame write")
+	}
+
+	packet, err := ipod.NewPacketReader(frame).ReadPacket()
+	if err != nil {
+		t.Fatalf("ReadPacket: %v", err)
+	}
+	var serde ipod.CommandSerde
+	got, err := serde.UnmarshalCmd(packet)
+	if err != nil {
+		t.Fatalf("UnmarshalCmd: %v", err)
+	}
+	notification, ok := got.Payload.(*extremote.PlayStatusChangeNotification)
+	if !ok {
+		t.Fatalf("payload = %T, want *PlayStatusChangeNotification", got.Payload)
+	}
+	if notification.Status != extremote.PlayStatusChangeTrackIndex || notification.TrackIndex != 4 {
+		t.Fatalf("notification = %#v, want track index 4", notification)
+	}
+
+	tr.reads <- readFrameResult{err: io.EOF}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("processFramesWithOptions: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for processFramesWithOptions")
+	}
+}
+
+func TestStartExtRemoteNotificationsBuildsTrackIndexCommand(t *testing.T) {
+	dev := &fakeTrackChangeDevice{changes: make(chan extremote.TrackChange, 1)}
+	notifications := extremote.NewPlayStatusNotificationState()
+	notifications.SetMask(extremote.PlayStatusNotificationTrackIndex)
+	out := make(chan *ipod.Command, 1)
+	stop := make(chan struct{})
+	defer close(stop)
+
+	startExtRemoteNotifications(dev, notifications, out, stop)
+	dev.changes <- extremote.TrackChange{TrackIndex: 7}
+
+	var cmd *ipod.Command
+	select {
+	case cmd = <-out:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for notification command")
+	}
+
+	notification, ok := cmd.Payload.(*extremote.PlayStatusChangeNotification)
+	if !ok {
+		t.Fatalf("payload = %T, want *PlayStatusChangeNotification", cmd.Payload)
+	}
+	if notification.Status != extremote.PlayStatusChangeTrackIndex || notification.TrackIndex != 7 {
+		t.Fatalf("notification = %#v, want track index 7", notification)
+	}
+	if cmd.Transaction == nil {
+		t.Fatal("notification command transaction is nil")
 	}
 }

@@ -249,7 +249,7 @@ type RetTrackArtworkData struct {
 	Data         []byte
 }
 
-//ack
+// ack
 type ResetDBSelection struct {
 }
 
@@ -369,9 +369,25 @@ type SetPlayStatusChangeNotification struct {
 type SetPlayStatusChangeNotificationShort struct {
 	Enabled bool
 }
+
+type PlayStatusChangeNotificationCode byte
+
+const (
+	PlayStatusChangeTrackIndex PlayStatusChangeNotificationCode = 0x01
+)
+
 type PlayStatusChangeNotification struct {
-	Status byte // finish
+	Status     PlayStatusChangeNotificationCode
+	TrackIndex int32
 }
+
+func NewTrackIndexPlayStatusChangeNotification(trackIndex int32) *PlayStatusChangeNotification {
+	return &PlayStatusChangeNotification{
+		Status:     PlayStatusChangeTrackIndex,
+		TrackIndex: trackIndex,
+	}
+}
+
 type PlayCurrentSelection struct {
 	SelectedTrackIndex int32
 }

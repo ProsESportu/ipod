@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"sync"
 	"time"
 
 	"os"
@@ -180,15 +181,22 @@ func main() {
 				frameTransport := hid.NewTransport(reportR, reportW, hidReportDefs)
 				frameErr := make(chan error, 1)
 				stopFrames := make(chan struct{})
+				asyncCommands := make(chan *ipod.Command, 16)
+				notifications := extremote.NewPlayStatusNotificationState()
+				devExtRemoteNotifications = notifications
+				stopNotifications := make(chan struct{})
+				startExtRemoteNotifications(devExtRemote, notifications, asyncCommands, stopNotifications)
 				go func() {
 					frameErr <- processFramesWithOptions(frameTransport, frameLoopOptions{
 						onPlaybackInitialized: bluealsa.Start,
 						stop:                  stopFrames,
+						asyncCommands:         asyncCommands,
 					})
 				}()
 
 				select {
 				case err := <-frameErr:
+					close(stopNotifications)
 					select {
 					case bluealsaErr := <-bluealsa.Err():
 						bluealsa.Stop()
@@ -203,6 +211,7 @@ func main() {
 					}
 					return err
 				case err := <-bluealsa.Err():
+					close(stopNotifications)
 					close(stopFrames)
 					f.Close()
 					<-frameErr
@@ -380,6 +389,46 @@ func logCmd(cmd *ipod.Command, err error, msg string) {
 
 }
 
+type commandFramer struct {
+	mu     sync.Mutex
+	serde  ipod.CommandSerde
+	writer ipod.FrameWriter
+}
+
+func newCommandFramer(writer ipod.FrameWriter) *commandFramer {
+	return &commandFramer{
+		writer: writer,
+	}
+}
+
+func (f *commandFramer) UnmarshalCmd(packet []byte) (*ipod.Command, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.serde.UnmarshalCmd(packet)
+}
+
+func (f *commandFramer) WriteCommand(outCmd *ipod.Command) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	logCmd(outCmd, nil, ">> CMD")
+
+	outPacket, err := f.serde.MarshalCmd(outCmd)
+	logPacket(outPacket, err, ">> PACKET")
+	if err != nil {
+		return err
+	}
+
+	packetWriter := ipod.NewPacketWriter()
+	if err := packetWriter.WritePacket(outPacket); err != nil {
+		return err
+	}
+	outFrame := packetWriter.Bytes()
+	outFrameErr := f.writer.WriteFrame(outFrame)
+	logFrame(outFrame, outFrameErr, ">> FRAME")
+	return outFrameErr
+}
+
 func processFrames(frameTransport ipod.FrameReadWriter) {
 	processFramesWithOptions(frameTransport, frameLoopOptions{})
 }
@@ -387,11 +436,37 @@ func processFrames(frameTransport ipod.FrameReadWriter) {
 type frameLoopOptions struct {
 	onPlaybackInitialized func() error
 	stop                  <-chan struct{}
+	asyncCommands         <-chan *ipod.Command
 }
 
 func processFramesWithOptions(frameTransport ipod.FrameReadWriter, opts frameLoopOptions) error {
-	serde := ipod.CommandSerde{}
+	cmdFramer := newCommandFramer(frameTransport)
 	playbackInitialized := false
+
+	if opts.asyncCommands != nil {
+		stopAsync := make(chan struct{})
+		asyncDone := make(chan struct{})
+		go func() {
+			defer close(asyncDone)
+			for {
+				select {
+				case <-stopAsync:
+					return
+				case cmd, ok := <-opts.asyncCommands:
+					if !ok {
+						return
+					}
+					if err := cmdFramer.WriteCommand(cmd); err != nil {
+						log.WithError(err).Error("async command write failed")
+					}
+				}
+			}
+		}()
+		defer func() {
+			close(stopAsync)
+			<-asyncDone
+		}()
+	}
 
 	for {
 		inFrame, err := frameTransport.ReadFrame()
@@ -420,7 +495,7 @@ func processFramesWithOptions(frameTransport ipod.FrameReadWriter, opts frameLoo
 				continue
 			}
 
-			inCmd, err := serde.UnmarshalCmd(inPacket)
+			inCmd, err := cmdFramer.UnmarshalCmd(inPacket)
 			logCmd(inCmd, err, "<< CMD")
 			inCmdBuf.WriteCommand(inCmd)
 		}
@@ -438,17 +513,7 @@ func processFramesWithOptions(frameTransport ipod.FrameReadWriter, opts frameLoo
 		writeErr := false
 		for i := range outCmdBuf.Commands {
 			outCmd := outCmdBuf.Commands[i]
-			logCmd(outCmd, nil, ">> CMD")
-
-			outPacket, err := serde.MarshalCmd(outCmd)
-			logPacket(outPacket, err, ">> PACKET")
-
-			packetWriter := ipod.NewPacketWriter()
-			packetWriter.WritePacket(outPacket)
-			outFrame := packetWriter.Bytes()
-			outFrameErr := frameTransport.WriteFrame(outFrame)
-			logFrame(outFrame, outFrameErr, ">> FRAME")
-			if outFrameErr != nil {
+			if err := cmdFramer.WriteCommand(outCmd); err != nil {
 				writeErr = true
 			}
 		}
@@ -469,6 +534,7 @@ func processFramesWithOptions(frameTransport ipod.FrameReadWriter, opts frameLoo
 
 var devGeneral = &DevGeneral{}
 var devExtRemote extremote.DeviceExtRemote
+var devExtRemoteNotifications = extremote.NewPlayStatusNotificationState()
 
 func ensureExtRemote() {
 	if devExtRemote == nil {
@@ -492,6 +558,40 @@ func initExtRemote() extremote.DeviceExtRemote {
 		c.WaitDeviceConnected()
 		return c
 	}
+}
+
+func startExtRemoteNotifications(dev extremote.DeviceExtRemote, notifications *extremote.PlayStatusNotificationState, out chan<- *ipod.Command, stop <-chan struct{}) {
+	source, ok := dev.(extremote.TrackChangeSource)
+	if !ok || source == nil || notifications == nil || out == nil {
+		return
+	}
+
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case change, ok := <-source.TrackChanges():
+				if !ok {
+					return
+				}
+				if !notifications.TrackIndexEnabled() {
+					continue
+				}
+				cmd, err := ipod.BuildCommand(extremote.NewTrackIndexPlayStatusChangeNotification(change.TrackIndex))
+				if err != nil {
+					log.WithError(err).Error("build play status change notification")
+					continue
+				}
+				cmd.Transaction = ipod.TrxNext()
+				select {
+				case out <- cmd:
+				case <-stop:
+					return
+				}
+			}
+		}
+	}()
 }
 
 type handlePacketResult struct {
@@ -519,7 +619,7 @@ func handlePacketWithResult(cmdWriter ipod.CommandWriter, cmd *ipod.Command) han
 	case ipod.LingoDisplayRemoteID:
 		dispremote.HandleDispRemote(cmd, cmdWriter, nil)
 	case ipod.LingoExtRemoteID:
-		extremote.HandleExtRemote(cmd, cmdWriter, devExtRemote)
+		extremote.HandleExtRemoteWithNotifications(cmd, cmdWriter, devExtRemote, devExtRemoteNotifications)
 	case ipod.LingoDigitalAudioID:
 		if _, ok := cmd.Payload.(*audio.RetAccSampleRateCaps); ok {
 			result.playbackInitialized = true

@@ -53,6 +53,12 @@ func ackStatus(req *ipod.Command, err error) *ACK {
 // HandleExtRemote dispatches an incoming ext-remote command. The dev argument
 // provides the live backing data (track info, play status, controls).
 func HandleExtRemote(req *ipod.Command, tr ipod.CommandWriter, dev DeviceExtRemote) error {
+	return HandleExtRemoteWithNotifications(req, tr, dev, nil)
+}
+
+// HandleExtRemoteWithNotifications dispatches an incoming ext-remote command
+// and updates notification subscription state for commands that configure it.
+func HandleExtRemoteWithNotifications(req *ipod.Command, tr ipod.CommandWriter, dev DeviceExtRemote, notifications *PlayStatusNotificationState) error {
 	switch msg := req.Payload.(type) {
 
 	case *GetCurrentPlayingTrackChapterInfo:
@@ -131,9 +137,7 @@ func HandleExtRemote(req *ipod.Command, tr ipod.CommandWriter, dev DeviceExtRemo
 	case *GetCurrentPlayingTrackIndex:
 		var idx int32
 		if dev != nil {
-			if n := dev.Track().TrackNumber; n > 0 {
-				idx = int32(n - 1)
-			}
+			idx = TrackIndexFromMetadata(dev.Track())
 		}
 		ipod.Respond(req, tr, &ReturnCurrentPlayingTrackIndex{
 			TrackIndex: idx,
@@ -151,8 +155,10 @@ func HandleExtRemote(req *ipod.Command, tr ipod.CommandWriter, dev DeviceExtRemo
 			AlbumName: ipod.StringToBytes(trackMeta(dev).Album),
 		})
 	case *SetPlayStatusChangeNotification:
+		notifications.SetMask(msg.EventMask)
 		ipod.Respond(req, tr, ackSuccess(req))
 	case *SetPlayStatusChangeNotificationShort:
+		notifications.SetShort(msg.Enabled)
 		ipod.Respond(req, tr, ackSuccess(req))
 	case *PlayCurrentSelection:
 		ipod.Respond(req, tr, ackSuccess(req))
@@ -211,10 +217,7 @@ func HandleExtRemote(req *ipod.Command, tr ipod.CommandWriter, dev DeviceExtRemo
 	case *SetCurrentPlayingTrack:
 		var err error
 		if dev != nil {
-			current := int32(0)
-			if n := dev.Track().TrackNumber; n > 0 {
-				current = int32(n - 1)
-			}
+			current := TrackIndexFromMetadata(dev.Track())
 			switch {
 			case msg.TrackIndex > current:
 				err = dev.PlayControl(PlayControlNextTrack)
